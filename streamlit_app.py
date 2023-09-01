@@ -1,38 +1,189 @@
-from collections import namedtuple
-import altair as alt
-import math
-import pandas as pd
+from langchain.chat_models import ChatOpenAI
+from langchain.prompts import PromptTemplate
+from langchain.chains import LLMChain
+from dotenv import load_dotenv
+from pytesseract import image_to_string
+from PIL import Image
+from io import BytesIO
+import pypdfium2 as pdfium
 import streamlit as st
+import multiprocessing
+from tempfile import NamedTemporaryFile
+import pandas as pd
+import json
+import requests
+from pytesseract import image_to_string
+from PIL import ImageEnhance
 
-"""
-# Welcome to Streamlit!
+load_dotenv()
 
-Edit `/streamlit_app.py` to customize this app to your heart's desire :heart:
+# 1. Convert PDF file into images via pypdfium2
 
-If you have any questions, checkout our [documentation](https://docs.streamlit.io) and [community
-forums](https://discuss.streamlit.io).
+# Fonction de prétraitement de l'image
+def preprocess_image(image):
+    image = image.convert('L')  # Convertir en niveaux de gris
+    enhancer = ImageEnhance.Contrast(image)
+    image = enhancer.enhance(1.8)  # Augmenter le contraste
+    return image
 
-In the meantime, below is an example of what you can do with just a few lines of code:
-"""
+def convert_pdf_to_images(file_path, scale=300/72):
+
+    pdf_file = pdfium.PdfDocument(file_path)
+
+    page_indices = [i for i in range(len(pdf_file))]
+
+    renderer = pdf_file.render(
+        pdfium.PdfBitmap.to_pil,
+        page_indices=page_indices,
+        scale=scale,
+    )
+
+    final_images = []
+
+    for i, image in zip(page_indices, renderer):
+
+        image_byte_array = BytesIO()
+        image.save(image_byte_array, format='jpeg', optimize=True)
+        image_byte_array = image_byte_array.getvalue()
+        final_images.append(dict({i: image_byte_array}))
+
+    return final_images
+
+# 2. Extract text from images via pytesseract
 
 
-with st.echo(code_location='below'):
-    total_points = st.slider("Number of points in spiral", 1, 5000, 2000)
-    num_turns = st.slider("Number of turns in spiral", 1, 100, 9)
+def extract_text_from_img(list_dict_final_images):
 
-    Point = namedtuple('Point', 'x y')
-    data = []
+    image_list = [list(data.values())[0] for data in list_dict_final_images]
+    image_content = []
 
-    points_per_turn = total_points / num_turns
+    for index, image_bytes in enumerate(image_list):
 
-    for curr_point_num in range(total_points):
-        curr_turn, i = divmod(curr_point_num, points_per_turn)
-        angle = (curr_turn + 1) * 2 * math.pi * i / points_per_turn
-        radius = curr_point_num / total_points
-        x = radius * math.cos(angle)
-        y = radius * math.sin(angle)
-        data.append(Point(x, y))
+        image = Image.open(BytesIO(image_bytes))
+        processed_image = preprocess_image(image)  # Appliquer le prétraitement
+        raw_text = str(image_to_string(processed_image, config='--psm 6'))  # Ajouter des paramètres supplémentaires
+        image_content.append(raw_text)
 
-    st.altair_chart(alt.Chart(pd.DataFrame(data), height=500, width=500)
-        .mark_circle(color='#0068c9', opacity=0.5)
-        .encode(x='x:Q', y='y:Q'))
+        #raw_text = str(image_to_string(image))
+        #image_content.append(raw_text)
+
+    return "\n".join(image_content)
+
+
+def extract_content_from_url(url: str):
+    images_list = convert_pdf_to_images(url)
+    text_with_pytesseract = extract_text_from_img(images_list)
+
+    return text_with_pytesseract
+
+
+# 3. Extract structured info from text via LLM
+def extract_structured_data(content: str, data_points):
+    llm = ChatOpenAI(temperature=0, model="gpt-3.5-turbo-0613")
+    template = """
+    You are an expert admin people who will extract core information from documents
+
+    {content}
+
+    Above is the content; please try to extract all data points from the content above 
+    and export in a JSON array format:
+    {data_points}
+
+    Now please extract details from the content  and export in a JSON array format, 
+    return ONLY the JSON array:
+    return in french
+    """
+
+    prompt = PromptTemplate(
+        input_variables=["content", "data_points"],
+        template=template,
+    )
+
+    chain = LLMChain(llm=llm, prompt=prompt)
+
+    results = chain.run(content=content, data_points=data_points)
+
+    return results
+
+
+# 4. Send data to make.com via webhook
+def send_to_make(data):
+    # Replace with your own link
+    webhook_url = "https://hook.eu1.make.com/xxxxxxxxxxxxxxxxx"
+
+    json = {
+        "data": data
+    }
+
+    try:
+        response = requests.post(webhook_url, json=json)
+        response.raise_for_status()  # Check for any HTTP errors
+        print("Data sent successfully!")
+    except requests.exceptions.RequestException as e:
+        print(f"Failed to send data: {e}")
+
+
+# 5. Streamlit app
+def main():
+    print("dans main")
+    #content = extract_content_from_url("X99 Task PEDS.pdf")
+    #print(content)
+
+    default_data_points = """{
+        "Material": "what is the Material of the document",
+        "Resumey": "what is the summary of the text?",
+    }"""
+
+    #data = extract_structured_data(content, default_data_points)
+    #print(data)
+    #json_data = json.loads(data)
+
+    
+    #default_data_points = """{
+    #    "invoice_item": "what is the item that charged",
+    #    "Amount": "how much does the invoice item cost in total",
+    #    "Company_name": "company that issued the invoice",
+    #    "invoice_date": "when was the invoice issued",
+    #}"""
+    
+    st.set_page_config(page_title="Doc extraction", page_icon=":bird:")
+
+    st.header("Doc extraction :bird:")
+
+    data_points = st.text_area(
+        "Data points", value=default_data_points, height=170)
+
+    uploaded_files = st.file_uploader(
+        "upload PDFs", accept_multiple_files=True)
+
+    if uploaded_files is not None and data_points is not None:
+        results = []
+        for file in uploaded_files:
+            with NamedTemporaryFile(dir='.', suffix='.csv') as f:
+                f.write(file.getbuffer())
+                content = extract_content_from_url(f.name)
+                print(content)
+                data = extract_structured_data(content, data_points)
+                json_data = json.loads(data)
+                if isinstance(json_data, list):
+                    results.extend(json_data)  # Use extend() for lists
+                else:
+                    results.append(json_data)  # Wrap the dict in a list
+        
+        if len(results) > 0:
+            try:
+                df = pd.DataFrame(results)
+                st.subheader("Results")
+                st.data_editor(df)
+                if st.button("Sync to Make"):
+                    #send_to_make(results)
+                    st.write("Synced to Make!")
+            except Exception as e:
+                st.error(
+                    f"An error occurred while creating the DataFrame: {e}")
+                st.write(results)  # Print the data to see its content
+    
+
+if __name__ == '__main__':
+    multiprocessing.freeze_support()
+    main()
